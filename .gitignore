@@ -1,30 +1,21 @@
-arpsponge.man
-arpsponge.ps
-arpsponge-*.tar.gz
-build-stamp
-configure-stamp
-debian/.debhelper/
-debian/debhelper-build-stamp
-debian/arpsponge/
-debian/*.*.log
-debian/*.substvars
-debian/*.*.debhelper
-debian/files
-defaults.sample
-init.d/arpsponge
-installed.log
-man/arpsponge.8
-man/arpsponge.pod
-man/asctl.8
-man/asctl.pod
-man/aslogtail.8
-man/aslogtail.pod
-sbin/arpsponge
-sbin/asctl
-sbin/aslogtail
-Build
-MYMETA.json
-MYMETA.yml
-_build/
-blib/
-cover_db/
+# Binaries
+arpsponge
+arpspongectl
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage*
+
+# Build output
+/dist/
+/bin/
+
+# IDE/OS
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,32 @@
+version: '3'
+
+vars:
+  VERSION: '{{.VERSION | default "dev"}}'
+  LDFLAGS: '-X main.version={{.VERSION}} -X arpsponge/internal/engine.Version={{.VERSION}}'
+
+tasks:
+  fmt:
+    desc: Format Go code
+    cmds:
+      - gofmt -w ./cmd ./internal
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  lint:
+    desc: Run golangci-lint (requires golangci-lint on PATH)
+    cmds:
+      - golangci-lint run ./...
+
+  test:
+    desc: Run tests
+    cmds:
+      - go test ./...
+
+  build:
+    desc: Build arpsponge and arpspongectl
+    cmds:
+      - go build -ldflags "{{.LDFLAGS}}" -o arpsponge ./cmd/arpsponge
+      - go build -ldflags "{{.LDFLAGS}}" -o arpspongectl ./cmd/arpspongectl
