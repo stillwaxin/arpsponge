@@ -239,7 +239,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		cfg := s.engine.Config()
-		writeJSON(w, http.StatusOK, configView(cfg))
+		writeJSON(w, http.StatusOK, toConfigView(cfg))
 	case http.MethodPost:
 		var req configUpdate
 		if err := readJSON(r, &req); err != nil {
@@ -256,7 +256,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		cfg := s.engine.Config()
 		s.logger.SetLevel(cfg.LogLevel)
 		s.logger.SetMask(cfg.LogMask)
-		writeJSON(w, http.StatusOK, configView(cfg))
+		writeJSON(w, http.StatusOK, toConfigView(cfg))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -351,7 +351,7 @@ type configView struct {
 	ArpUpdateMethod []string `json:"arp_update_method"`
 }
 
-func configView(cfg engine.Config) configView {
+func toConfigView(cfg engine.Config) configView {
 	return configView{
 		QueueDepth:      cfg.QueueDepth,
 		MaxRate:         cfg.MaxRate,

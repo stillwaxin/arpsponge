@@ -40,13 +40,14 @@ sudo ./arpsponge 192.0.2.0/24 dev eth0 \
   --rate=50 \
   --queuedepth=1000 \
   --pending=5 \
+  --mac=02:de:ad:be:ef:01 \
   --sweep=900/3600
 ```
 
 Alternative flags:
 
 ```
-sudo ./arpsponge --network 192.0.2.0/24 --interface eth0
+sudo ./arpsponge --network 192.0.2.0/24 --interface eth0 --mac 02:de:ad:be:ef:01
 ```
 
 Key options:
@@ -56,6 +57,7 @@ Key options:
 - `--sweep`: `period/age` in seconds (e.g., `900/3600`)
 - `--passive`: do not send ARP queries
 - `--dummy`: do not send any packets
+- `--mac` (experimental): override source MAC address (may disrupt normal traffic on some systems)
 - `--arp-update-method`: `reply,request,gratuitous` or `none`
 
 Control socket default path:
