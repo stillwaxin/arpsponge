@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/user"
 	"strconv"
+	"syscall"
 )
 
 // linux-only: Unix socket ownership and permission handling.
@@ -15,7 +16,12 @@ func ListenUnix(path string, owner string, group string, perm os.FileMode) (net.
 	if err := os.RemoveAll(path); err != nil {
 		return nil, err
 	}
+
+	// Securely create socket with restricted permissions to prevent race condition
+	oldMask := syscall.Umask(0o077)
 	ln, err := net.Listen("unix", path)
+	syscall.Umask(oldMask)
+
 	if err != nil {
 		return nil, err
 	}

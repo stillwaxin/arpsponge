@@ -9,7 +9,7 @@ This repository contains a Linux-focused Go rewrite of the original Perl impleme
 - Linux
 - Go 1.21+
 - libpcap development headers (`libpcap-dev` on Debian/Ubuntu)
-- Privileges for raw capture/injection (root or capabilities)
+- Privileges for raw capture/injection (capabilities recommended, see Security)
 
 ## Build
 
@@ -62,6 +62,16 @@ Key options:
 
 Control socket default path:
 - `/run/arpsponge/<interface>/control.sock`
+
+## Security
+
+For production use, avoid running as root. Instead, grant the binary the necessary capabilities:
+
+```bash
+sudo setcap cap_net_raw,cap_net_admin=eip ./arpsponge
+```
+
+Ensure the control socket directory is writable only by the user running the daemon to prevent unauthorized control.
 
 ## Control CLI
 
