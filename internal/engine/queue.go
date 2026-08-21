@@ -79,13 +79,6 @@ func (q *Queue) Rate(ip uint32) float64 {
 	return (n / delta) * 60.0
 }
 
-func (q *Queue) GetQueue(ip uint32) []queueEntry {
-	entries := q.q[ip]
-	out := make([]queueEntry, len(entries))
-	copy(out, entries)
-	return out
-}
-
 func (q *Queue) Reduce(ip uint32, maxRate float64) int {
 	entries := q.q[ip]
 	if len(entries) == 0 {
@@ -109,18 +102,13 @@ func (q *Queue) Reduce(ip uint32, maxRate float64) int {
 	})
 
 	var reduced []queueEntry
-	var prev *queueEntry
+	var lastKept *queueEntry
 	for i := range sorted {
 		entry := &sorted[i]
-		if prev != nil {
-			if entry.src != prev.src || entry.ts.Sub(prev.ts) >= minDelta {
-				reduced = append(reduced, *prev)
-			}
+		if lastKept == nil || entry.src != lastKept.src || entry.ts.Sub(lastKept.ts) >= minDelta {
+			reduced = append(reduced, *entry)
+			lastKept = entry
 		}
-		prev = entry
-	}
-	if prev != nil {
-		reduced = append(reduced, *prev)
 	}
 
 	sort.Slice(reduced, func(i, j int) bool {

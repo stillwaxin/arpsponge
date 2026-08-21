@@ -2,7 +2,7 @@
 
 `arpsponge` is a daemon that mitigates ARP storms on large L2 networks. It listens on an Ethernet interface and, when ARP requests for a given IP exceed a threshold, it starts replying on behalf of that IP to absorb the storm.
 
-This repository contains a Linux-focused Go rewrite of the original Perl implementation. The archived Perl code and documentation live under `archive/`.
+This repository contains a Linux-focused Go rewrite of the original Perl implementation. The original Perl project and documentation are available upstream at [github.com/AMS-IX/arpsponge](https://github.com/AMS-IX/arpsponge).
 
 ## Requirements
 
@@ -51,17 +51,37 @@ sudo ./arpsponge --network 192.0.2.0/24 --interface eth0 --mac 02:de:ad:be:ef:01
 ```
 
 Key options:
+- `--age`: expire learned ARP entries after this many seconds (`0` disables expiry)
 - `--rate`: threshold rate in queries/minute
 - `--queuedepth`: per-IP queue size for ARP request sampling
 - `--pending`: number of probe cycles before sponging
+- `--proberate`: positive aggregate query rate (q/s) shared by pending probes
+  and sweeps (`0` disables pacing); pending probes are prioritized, while an
+  aging sweep can eventually receive a shared slot
+- `--init`: virtual state for previously unseen addresses (`ALIVE`, `DEAD`, `PENDING`, or `NONE`)
 - `--sweep`: `period/age` in seconds (e.g., `900/3600`)
 - `--passive`: do not send ARP queries
 - `--dummy`: do not send any packets
 - `--mac` (experimental): override source MAC address (may disrupt normal traffic on some systems)
 - `--arp-update-method`: `reply,request,gratuitous` or `none`
+- `--pidfile`: atomically publish the daemon PID and prevent a second daemon using the same pidfile; the PID file is removed on exit
+- `--daemon`: deprecated compatibility no-op; emits a warning and relies on the service manager for backgrounding
+
+`arpspongectl ip clear` removes materialized per-address state but does not
+rewrite the configured `--init` policy. Subsequent read-only lookups report that
+virtual policy without creating state or scheduling probes; packet processing
+materializes state when it needs to write it.
+
+The pidfile lock uses a persistent `<pidfile>.lock` sidecar. The sidecar is
+intentionally retained across restarts so replacing the visible pidfile cannot
+create an inode-lock race.
 
 Control socket default path:
 - `/run/arpsponge/<interface>/control.sock`
+
+At startup, an existing Unix socket at that path is replaced. A directory,
+regular file, symlink, or other non-socket node is preserved and causes startup
+to fail instead of being deleted.
 
 ## Security
 
@@ -93,6 +113,7 @@ Version check:
 
 See `ARCHITECTURE.md` for a component-level view and data flow.
 
-## Archived Perl Implementation
+## Original Perl Implementation
 
-The original Perl code and documentation are preserved under `archive/`.
+The original Perl project and documentation are available upstream at
+[github.com/AMS-IX/arpsponge](https://github.com/AMS-IX/arpsponge).

@@ -1,11 +1,13 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"arpsponge/internal/netutil"
@@ -74,6 +76,173 @@ type ArpEntry struct {
 	Time int64
 }
 
+type queryPacerSweepWaiter struct {
+	since time.Time
+}
+
+// queryPacer enforces one shared aggregate query budget for pending probes and
+// sweeps when its pacing rate is positive; a zero rate disables pacing. Pending
+// probes normally have priority, but a sweep waiter becomes eligible after ten
+// current pacing intervals. An aged sweep consumes the ordinary shared slot;
+// when pending demand exists, its grant requires a pending grant next so sweeps
+// cannot receive consecutive grants.
+type queryPacer struct {
+	mu             sync.Mutex
+	changed        chan struct{}
+	interval       time.Duration
+	next           time.Time
+	lastGrant      time.Time
+	pendingWaiters int
+	sweepWaiters   []*queryPacerSweepWaiter
+	// pendingGrantRequired restores pending priority after a forced sweep.
+	// It is cleared at the next slot when no pending waiter exists.
+	pendingGrantRequired bool
+}
+
+func (p *queryPacer) configure(rate float64) {
+	interval := time.Duration(0)
+	if rate > 0 {
+		interval = time.Duration(float64(time.Second) / rate)
+		if interval <= 0 {
+			interval = time.Nanosecond
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.interval == interval {
+		return
+	}
+	p.interval = interval
+	if interval == 0 {
+		p.lastGrant = time.Time{}
+		p.next = time.Time{}
+		p.pendingGrantRequired = false
+	} else if p.lastGrant.IsZero() {
+		p.next = time.Time{}
+	} else {
+		p.next = p.lastGrant.Add(interval)
+	}
+	p.signalLocked()
+}
+
+func (p *queryPacer) wait(ctx context.Context, pending bool) bool {
+	p.mu.Lock()
+	if p.changed == nil {
+		p.changed = make(chan struct{})
+	}
+	var sweepWaiter *queryPacerSweepWaiter
+	if pending {
+		p.pendingWaiters++
+	} else {
+		sweepWaiter = &queryPacerSweepWaiter{since: time.Now()}
+		p.sweepWaiters = append(p.sweepWaiters, sweepWaiter)
+	}
+	p.signalLocked()
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		if pending {
+			p.pendingWaiters--
+		} else {
+			p.removeSweepWaiterLocked(sweepWaiter)
+		}
+		p.signalLocked()
+		p.mu.Unlock()
+	}()
+
+	for {
+		p.mu.Lock()
+		if p.interval == 0 {
+			p.mu.Unlock()
+			return true
+		}
+		now := time.Now()
+		if p.next.IsZero() || !now.Before(p.next) {
+			agedSweep := p.oldestAgedSweepWaiterLocked(now)
+			if p.pendingGrantRequired && p.pendingWaiters == 0 {
+				p.pendingGrantRequired = false
+			}
+			pendingAllowed := pending && (p.pendingGrantRequired || agedSweep == nil)
+			sweepAllowed := !pending && (p.pendingWaiters == 0 || (!p.pendingGrantRequired && agedSweep == sweepWaiter))
+			if pendingAllowed || sweepAllowed {
+				p.lastGrant = now
+				p.next = now.Add(p.interval)
+				if pending {
+					p.pendingGrantRequired = false
+				} else if p.pendingWaiters > 0 && agedSweep == sweepWaiter {
+					p.pendingGrantRequired = true
+				}
+				p.signalLocked()
+				p.mu.Unlock()
+				return true
+			}
+			wake := p.changed
+			p.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return false
+			case <-wake:
+			}
+			continue
+		}
+
+		wait := time.Until(p.next)
+		wake := p.changed
+		p.mu.Unlock()
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return false
+		case <-wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+		}
+	}
+}
+
+func (p *queryPacer) oldestAgedSweepWaiterLocked(now time.Time) *queryPacerSweepWaiter {
+	if len(p.sweepWaiters) == 0 {
+		return nil
+	}
+	oldest := p.sweepWaiters[0]
+	if now.Sub(oldest.since) < 10*p.interval {
+		return nil
+	}
+	return oldest
+}
+
+func (p *queryPacer) removeSweepWaiterLocked(waiter *queryPacerSweepWaiter) {
+	for i, candidate := range p.sweepWaiters {
+		if candidate != waiter {
+			continue
+		}
+		copy(p.sweepWaiters[i:], p.sweepWaiters[i+1:])
+		p.sweepWaiters[len(p.sweepWaiters)-1] = nil
+		p.sweepWaiters = p.sweepWaiters[:len(p.sweepWaiters)-1]
+		return
+	}
+}
+
+func (p *queryPacer) signalLocked() {
+	if p.changed == nil {
+		p.changed = make(chan struct{})
+		return
+	}
+	close(p.changed)
+	p.changed = make(chan struct{})
+}
+
 type Engine struct {
 	mu sync.Mutex
 
@@ -93,11 +262,21 @@ type Engine struct {
 
 	queue *Queue
 
-	state      map[uint32]State
-	stateAtime map[uint32]int64
-	stateMtime map[uint32]int64
-	arpTable   map[uint32]ArpEntry
-	pending    map[uint32]struct{}
+	state         map[uint32]State
+	stateAtime    map[uint32]int64
+	stateMtime    map[uint32]int64
+	arpTable      map[uint32]ArpEntry
+	arpExpiry     map[int64]map[uint32]int64
+	nextARPExpiry int64
+	pending       map[uint32]struct{}
+	cleared       map[uint32]struct{}
+	queryPacer    queryPacer
+
+	pendingProbeSendMu sync.RWMutex
+
+	// initialState applies to previously unseen addresses until state is
+	// explicitly cleared. It keeps --init sparse even for large networks.
+	initialState State
 
 	logger Logger
 	sender Sender
@@ -110,6 +289,15 @@ type Engine struct {
 	lastStaticWarn time.Time
 	lastStaticMsg  string
 	staticWarns    int
+
+	lifecycleMu sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	passWG      sync.WaitGroup
+	stopped     bool
+
+	probeInProgress atomic.Bool
+	sweepInProgress atomic.Bool
 }
 
 func New(cfg Config, device string, network *net.IPNet, netIP uint32, broadcast uint32, prefixLen int, myIP uint32, myMAC packet.MAC, ownIPs []uint32, sender Sender, logger Logger) *Engine {
@@ -121,28 +309,35 @@ func New(cfg Config, device string, network *net.IPNet, netIP uint32, broadcast 
 		ownSet[ip] = struct{}{}
 	}
 	ownSet[myIP] = struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
-		cfg:        cfg,
-		device:     device,
-		network:    network,
-		prefixLen:  prefixLen,
-		netIP:      netIP,
-		broadcast:  broadcast,
-		myIP:       myIP,
-		myMAC:      myMAC,
-		myIPs:      ownSet,
-		netLo:      netIP,
-		netHi:      broadcast,
-		queue:      NewQueue(cfg.QueueDepth),
-		state:      make(map[uint32]State),
-		stateAtime: make(map[uint32]int64),
-		stateMtime: make(map[uint32]int64),
-		arpTable:   make(map[uint32]ArpEntry),
-		pending:    make(map[uint32]struct{}),
-		logger:     logger,
-		sender:     sender,
-		startTime:  time.Now(),
+		cfg:          cfg,
+		device:       device,
+		network:      network,
+		prefixLen:    prefixLen,
+		netIP:        netIP,
+		broadcast:    broadcast,
+		myIP:         myIP,
+		myMAC:        myMAC,
+		myIPs:        ownSet,
+		netLo:        netIP,
+		netHi:        broadcast,
+		queue:        NewQueue(cfg.QueueDepth),
+		state:        make(map[uint32]State),
+		stateAtime:   make(map[uint32]int64),
+		stateMtime:   make(map[uint32]int64),
+		arpTable:     make(map[uint32]ArpEntry),
+		arpExpiry:    make(map[int64]map[uint32]int64),
+		pending:      make(map[uint32]struct{}),
+		cleared:      make(map[uint32]struct{}),
+		initialState: cfg.InitState,
+		logger:       logger,
+		sender:       sender,
+		startTime:    time.Now(),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
+	e.queryPacer.configure(cfg.Proberate)
 	e.learningLeft = cfg.LearnSeconds
 	if cfg.SweepPeriod > 0 {
 		e.nextSweep = time.Now().Add(time.Duration(cfg.SweepPeriod) * time.Second)
@@ -155,7 +350,9 @@ func New(cfg Config, device string, network *net.IPNet, netIP uint32, broadcast 
 		e.forcedPassive = true
 		e.cfg.Passive = true
 	}
-	e.initAllStateLocked(cfg.InitState)
+	for ip := range e.myIPs {
+		e.setAliveLocked(ip, e.myMAC)
+	}
 	return e
 }
 
@@ -204,7 +401,19 @@ func (e *Engine) UpdateConfig(update func(cfg *Config) error) error {
 	if e.forcedPassive {
 		cfg.Passive = true
 	}
+	learnSecondsChanged := cfg.LearnSeconds != e.cfg.LearnSeconds
+	arpAgeChanged := cfg.ArpAge != e.cfg.ArpAge
+	proberateChanged := cfg.Proberate != e.cfg.Proberate
 	e.cfg = cfg
+	if learnSecondsChanged {
+		e.learningLeft = cfg.LearnSeconds
+	}
+	if arpAgeChanged {
+		e.rebuildARPExpiryLocked()
+	}
+	if proberateChanged {
+		e.queryPacer.configure(cfg.Proberate)
+	}
 	e.queue.SetMaxDepth(cfg.QueueDepth)
 	if cfg.SweepPeriod <= 0 {
 		e.nextSweep = time.Time{}
@@ -212,20 +421,6 @@ func (e *Engine) UpdateConfig(update func(cfg *Config) error) error {
 		e.nextSweep = time.Now().Add(time.Duration(cfg.SweepPeriod) * time.Second)
 	}
 	return nil
-}
-
-func (e *Engine) initAllStateLocked(state State) {
-	if state != StateNone {
-		for ip := e.netLo; ; ip++ {
-			e.setStateLocked(ip, state, 0)
-			if ip == e.netHi {
-				break
-			}
-		}
-	}
-	for ip := range e.myIPs {
-		e.setAliveLocked(ip, e.myMAC)
-	}
 }
 
 func (e *Engine) setStateLocked(ip uint32, state State, now int64) {
@@ -237,6 +432,94 @@ func (e *Engine) setStateLocked(ip uint32, state State, now int64) {
 	e.state[ip] = state
 	e.stateMtime[ip] = now
 	e.stateAtime[ip] = now
+	delete(e.cleared, ip)
+}
+
+func (e *Engine) setARPEntryLocked(ip uint32, mac packet.MAC, learnedAt int64) {
+	if oldEntry, ok := e.arpTable[ip]; ok {
+		e.untrackARPExpiryLocked(ip, oldEntry.Time)
+	}
+	e.arpTable[ip] = ArpEntry{MAC: mac, Time: learnedAt}
+	e.trackARPExpiryLocked(ip, learnedAt)
+}
+
+func (e *Engine) trackARPExpiryLocked(ip uint32, learnedAt int64) {
+	if e.cfg.ArpAge <= 0 {
+		return
+	}
+	expiresAt := learnedAt + int64(e.cfg.ArpAge) + 1
+	bucket := e.arpExpiry[expiresAt]
+	if bucket == nil {
+		bucket = make(map[uint32]int64)
+		e.arpExpiry[expiresAt] = bucket
+	}
+	bucket[ip] = learnedAt
+	if e.nextARPExpiry == 0 || expiresAt < e.nextARPExpiry {
+		e.nextARPExpiry = expiresAt
+	}
+}
+
+func (e *Engine) untrackARPExpiryLocked(ip uint32, learnedAt int64) {
+	if e.cfg.ArpAge <= 0 {
+		return
+	}
+	expiresAt := learnedAt + int64(e.cfg.ArpAge) + 1
+	bucket := e.arpExpiry[expiresAt]
+	if bucket == nil {
+		return
+	}
+	delete(bucket, ip)
+	if len(bucket) == 0 {
+		delete(e.arpExpiry, expiresAt)
+	}
+	if e.nextARPExpiry == expiresAt {
+		e.refreshNextARPExpiryLocked()
+	}
+}
+
+func (e *Engine) refreshNextARPExpiryLocked() {
+	e.nextARPExpiry = 0
+	for expiresAt := range e.arpExpiry {
+		if e.nextARPExpiry == 0 || expiresAt < e.nextARPExpiry {
+			e.nextARPExpiry = expiresAt
+		}
+	}
+}
+
+func (e *Engine) rebuildARPExpiryLocked() {
+	e.arpExpiry = make(map[int64]map[uint32]int64)
+	e.nextARPExpiry = 0
+	if e.cfg.ArpAge <= 0 {
+		return
+	}
+	for ip, entry := range e.arpTable {
+		e.trackARPExpiryLocked(ip, entry.Time)
+	}
+}
+
+func (e *Engine) expireARPEntriesLocked(now int64) {
+	if e.cfg.ArpAge <= 0 {
+		return
+	}
+	if e.nextARPExpiry == 0 && len(e.arpTable) > 0 {
+		e.rebuildARPExpiryLocked()
+	}
+	if e.nextARPExpiry == 0 || now < e.nextARPExpiry {
+		return
+	}
+	for expiresAt, bucket := range e.arpExpiry {
+		if expiresAt > now {
+			continue
+		}
+		for ip, learnedAt := range bucket {
+			entry, ok := e.arpTable[ip]
+			if ok && entry.Time == learnedAt {
+				delete(e.arpTable, ip)
+			}
+		}
+		delete(e.arpExpiry, expiresAt)
+	}
+	e.refreshNextARPExpiryLocked()
 }
 
 func (e *Engine) clearStateLocked(ip uint32) {
@@ -244,12 +527,25 @@ func (e *Engine) clearStateLocked(ip uint32) {
 	delete(e.stateAtime, ip)
 	delete(e.stateMtime, ip)
 	delete(e.pending, ip)
+	e.cleared[ip] = struct{}{}
 	e.queue.Clear(ip)
 }
 
-func (e *Engine) getStateLocked(ip uint32) (State, bool) {
-	state, ok := e.state[ip]
-	return state, ok
+func (e *Engine) effectiveStateLocked(ip uint32) (State, bool) {
+	if state, ok := e.state[ip]; ok {
+		return state, true
+	}
+	return e.initialStateLocked(ip)
+}
+
+func (e *Engine) initialStateLocked(ip uint32) (State, bool) {
+	if e.initialState == StateNone || !e.isMyNetwork(ip) {
+		return StateNone, false
+	}
+	if _, cleared := e.cleared[ip]; cleared {
+		return StateNone, false
+	}
+	return e.initialState, true
 }
 
 func (e *Engine) setStateAtimeLocked(ip uint32, now int64) {
@@ -267,6 +563,9 @@ func (e *Engine) setPendingLocked(ip uint32, n int) {
 
 func (e *Engine) incrPendingLocked(ip uint32) {
 	state := e.state[ip]
+	if state <= StateAlive {
+		return
+	}
 	pending := int(state)
 	e.setPendingLocked(ip, pending+1)
 }
@@ -293,7 +592,7 @@ func (e *Engine) setAliveLocked(ip uint32, mac packet.MAC) {
 	if !e.isMyNetwork(ip) {
 		return
 	}
-	oldState, _ := e.getStateLocked(ip)
+	oldState, hadState := e.effectiveStateLocked(ip)
 	oldEntry, hasOld := e.arpTable[ip]
 	if mac.IsZero() && hasOld {
 		mac = oldEntry.MAC
@@ -306,19 +605,16 @@ func (e *Engine) setAliveLocked(ip uint32, mac packet.MAC) {
 	} else if oldEntry.MAC != mac {
 		e.logf(LevelDebug, EventState, "learned: ip=%s mac=%s old=%s", netutil.IPv4String(ip), mac.String(), oldEntry.MAC.String())
 	}
-	if !mac.IsZero() {
-		e.logf(LevelDebug, EventState, "clearing: ip=%s mac=%s", netutil.IPv4String(ip), mac.String())
-	}
 	e.queue.Clear(ip)
 	e.setStateLocked(ip, StateAlive, time.Now().Unix())
 	if !mac.IsZero() {
-		e.arpTable[ip] = ArpEntry{MAC: mac, Time: time.Now().Unix()}
+		e.setARPEntryLocked(ip, mac, time.Now().Unix())
 	}
-	if oldState == StateDead {
+	if hadState && oldState == StateDead {
 		e.logf(LevelNotice, EventSponge, "unsponging: ip=%s mac=%s", netutil.IPv4String(ip), mac.String())
 		return
 	}
-	if oldState >= 0 {
+	if hadState && oldState >= 0 {
 		e.logf(LevelNotice, EventSponge, "clearing: ip=%s mac=%s", netutil.IPv4String(ip), mac.String())
 		return
 	}
@@ -366,7 +662,10 @@ func (e *Engine) handleIPv4(pkt packet.Packet) {
 	}
 	e.updateStateFromTraffic(srcIP, pkt.SrcMAC)
 
-	if e.cfg.ArpUpdateFlags == UpdateNone {
+	e.mu.Lock()
+	arpUpdateFlags := e.cfg.ArpUpdateFlags
+	e.mu.Unlock()
+	if arpUpdateFlags == UpdateNone {
 		return
 	}
 	if pkt.DstMAC != e.myMAC {
@@ -375,7 +674,7 @@ func (e *Engine) handleIPv4(pkt packet.Packet) {
 	dstIP := pkt.IPv4.DstIP
 	if e.isMyNetwork(dstIP) && !e.isMyIP(dstIP) {
 		e.mu.Lock()
-		state := e.state[dstIP]
+		state, _ := e.effectiveStateLocked(dstIP)
 		entry, ok := e.arpTable[dstIP]
 		e.mu.Unlock()
 		if state == StateAlive && ok && !entry.MAC.IsZero() {
@@ -387,14 +686,14 @@ func (e *Engine) handleIPv4(pkt packet.Packet) {
 func (e *Engine) updateStateFromTraffic(srcIP uint32, srcMAC packet.MAC) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	state, ok := e.state[srcIP]
+	state, ok := e.effectiveStateLocked(srcIP)
 	if !ok {
 		state = StateAlive
 	}
 	if e.cfg.Static && state < StateAlive {
 		err := fmt.Sprintf("traffic from STATIC sponged IP: src.mac=%s src.ip=%s", srcMAC.String(), netutil.IPv4String(srcIP))
 		e.logStaticWarn(err)
-		e.arpTable[srcIP] = ArpEntry{MAC: srcMAC, Time: time.Now().Unix()}
+		e.setARPEntryLocked(srcIP, srcMAC, time.Now().Unix())
 		return
 	}
 	e.setAliveLocked(srcIP, srcMAC)
@@ -429,6 +728,10 @@ func (e *Engine) handleARP(pkt packet.Packet) {
 	if arp.Opcode != packet.ARPOpRequest {
 		return
 	}
+	e.mu.Lock()
+	learningLeft := e.learningLeft
+	spongeNet := e.cfg.SpongeNet
+	e.mu.Unlock()
 
 	if arp.SenderMAC != pkt.SrcMAC {
 		e.logf(LevelWarning, EventSpoof,
@@ -458,7 +761,7 @@ func (e *Engine) handleARP(pkt packet.Packet) {
 			pkt.SrcMAC.String(), netutil.IPv4String(dstIP),
 		)
 		e.mu.Lock()
-		state, ok := e.getStateLocked(dstIP)
+		state, ok := e.effectiveStateLocked(dstIP)
 		if ok && state != StateAlive && !e.cfg.Static {
 			e.setPendingLocked(dstIP, 0)
 		}
@@ -471,7 +774,7 @@ func (e *Engine) handleARP(pkt packet.Packet) {
 			"ARP for network address: src.mac=%s arp.spa=%s arp.tpa=%s",
 			pkt.SrcMAC.String(), netutil.IPv4String(srcIP), netutil.IPv4String(dstIP),
 		)
-		if e.cfg.SpongeNet {
+		if spongeNet {
 			_ = e.sendReply(dstIP, arp)
 		}
 		return
@@ -482,26 +785,30 @@ func (e *Engine) handleARP(pkt packet.Packet) {
 			"ARP for broadcast address: src.mac=%s arp.spa=%s arp.tpa=%s",
 			pkt.SrcMAC.String(), netutil.IPv4String(srcIP), netutil.IPv4String(dstIP),
 		)
-		if e.cfg.SpongeNet {
+		if spongeNet {
 			_ = e.sendReply(dstIP, arp)
 		}
 		return
 	}
 
-	if e.learningLeft > 0 {
+	if learningLeft > 0 {
 		return
 	}
 
 	now := time.Now()
 	e.mu.Lock()
 	e.queue.Add(dstIP, srcIP, now)
-	state, ok := e.getStateLocked(dstIP)
+	state, ok := e.effectiveStateLocked(dstIP)
+	_, materialized := e.state[dstIP]
 	if !ok {
 		if !e.cfg.Static {
 			e.setPendingLocked(dstIP, 0)
 		}
 		e.mu.Unlock()
 		return
+	}
+	if !materialized && state >= 0 {
+		e.setPendingLocked(dstIP, int(state))
 	}
 	if state <= StateDead {
 		e.mu.Unlock()
@@ -552,6 +859,7 @@ func (e *Engine) handleARP(pkt packet.Packet) {
 
 func (e *Engine) Tick(now time.Time) {
 	e.mu.Lock()
+	e.expireARPEntriesLocked(now.Unix())
 	if e.learningLeft > 0 {
 		e.learningLeft--
 		left := e.learningLeft
@@ -563,11 +871,60 @@ func (e *Engine) Tick(now time.Time) {
 	}
 	e.mu.Unlock()
 
-	e.probePending(now)
-	e.sweepIfNeeded(now)
+	e.startPass(&e.probeInProgress, func(ctx context.Context) {
+		e.probePending(ctx, now)
+	})
+	e.startPass(&e.sweepInProgress, func(ctx context.Context) {
+		e.sweepIfNeeded(ctx, now)
+	})
 }
 
-func (e *Engine) probePending(now time.Time) {
+func (e *Engine) startPass(inProgress *atomic.Bool, work func(context.Context)) {
+	e.lifecycleMu.Lock()
+	if e.stopped || !inProgress.CompareAndSwap(false, true) {
+		e.lifecycleMu.Unlock()
+		return
+	}
+	e.passWG.Add(1)
+	ctx := e.ctx
+	e.lifecycleMu.Unlock()
+
+	go func() {
+		defer e.passWG.Done()
+		defer inProgress.Store(false)
+		work(ctx)
+	}()
+}
+
+// Stop cancels background probe and sweep work and waits for it to exit.
+// It is safe to call more than once.
+func (e *Engine) Stop() {
+	e.lifecycleMu.Lock()
+	if !e.stopped {
+		e.stopped = true
+		e.cancel()
+	}
+	e.lifecycleMu.Unlock()
+	e.passWG.Wait()
+}
+
+func (e *Engine) waitForProbeRate(ctx context.Context, pending bool) bool {
+	return e.queryPacer.wait(ctx, pending)
+}
+
+func (e *Engine) sendPendingProbe(ip uint32) {
+	e.pendingProbeSendMu.RLock()
+	defer e.pendingProbeSendMu.RUnlock()
+	e.mu.Lock()
+	state, ok := e.state[ip]
+	e.mu.Unlock()
+	if !ok || state <= StateAlive {
+		return
+	}
+	_ = e.sendQuery(ip)
+}
+
+func (e *Engine) probePending(ctx context.Context, now time.Time) {
 	e.mu.Lock()
 	if e.forcedPassive {
 		e.mu.Unlock()
@@ -578,7 +935,6 @@ func (e *Engine) probePending(now time.Time) {
 	for ip := range e.pending {
 		pending = append(pending, ip)
 	}
-	proberate := e.cfg.Proberate
 	maxPending := e.cfg.MaxPending
 	passive := e.cfg.Passive
 	staticMode := e.cfg.Static
@@ -588,18 +944,22 @@ func (e *Engine) probePending(now time.Time) {
 		return
 	}
 
-	sleep := time.Duration(0)
-	if proberate > 0 {
-		sleep = time.Duration(float64(time.Second) / proberate)
-	}
-
 	processed := 0
 	for _, ip := range pending {
-		processed++
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		e.mu.Lock()
-		state := e.state[ip]
+		state, ok := e.state[ip]
+		if !ok || state <= StateAlive {
+			e.mu.Unlock()
+			continue
+		}
+		processed++
 		pendingCount := int(state)
-		if pendingCount > maxPending {
+		if pendingCount >= maxPending {
 			e.setDeadLocked(ip)
 			e.mu.Unlock()
 			continue
@@ -612,10 +972,10 @@ func (e *Engine) probePending(now time.Time) {
 		e.mu.Unlock()
 
 		if !passive {
-			_ = e.sendQuery(ip)
-		}
-		if sleep > 0 {
-			time.Sleep(sleep)
+			if !e.waitForProbeRate(ctx, true) {
+				return
+			}
+			e.sendPendingProbe(ip)
 		}
 	}
 	if processed > 1 {
@@ -623,14 +983,13 @@ func (e *Engine) probePending(now time.Time) {
 	}
 }
 
-func (e *Engine) sweepIfNeeded(now time.Time) {
+func (e *Engine) sweepIfNeeded(ctx context.Context, now time.Time) {
 	e.mu.Lock()
 	if e.cfg.SweepPeriod <= 0 || e.nextSweep.IsZero() || now.Before(e.nextSweep) {
 		e.mu.Unlock()
 		return
 	}
 	sweepAge := e.cfg.SweepAge
-	proberate := e.cfg.Proberate
 	passive := e.cfg.Passive
 	staticMode := e.cfg.Static
 	skipAlive := e.cfg.SweepSkipAlive
@@ -646,15 +1005,15 @@ func (e *Engine) sweepIfNeeded(now time.Time) {
 
 	e.logf(LevelNotice, EventState, "sweeping for quiet entries on %s/%d", netutil.IPv4String(e.netIP), e.prefixLen)
 
-	sleep := time.Duration(0)
-	if proberate > 0 {
-		sleep = time.Duration(float64(time.Second) / proberate)
-	}
-
 	queried := 0
 	for ip := e.netLo; ; ip++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		e.mu.Lock()
-		state, ok := e.getStateLocked(ip)
+		state, ok := e.effectiveStateLocked(ip)
 		mtime := e.stateMtime[ip]
 		entry, hasEntry := e.arpTable[ip]
 		e.mu.Unlock()
@@ -676,14 +1035,14 @@ func (e *Engine) sweepIfNeeded(now time.Time) {
 		}
 
 		if doQuery {
+			if !e.waitForProbeRate(ctx, false) {
+				return
+			}
 			_ = e.sendQuery(ip)
 			e.mu.Lock()
 			e.setStateMtimeLocked(ip, time.Now().Unix())
 			e.mu.Unlock()
 			queried++
-			if sleep > 0 {
-				time.Sleep(sleep)
-			}
 		}
 		if ip == e.netHi {
 			break
@@ -868,18 +1227,23 @@ func (e *Engine) SetIPState(ip uint32, state State, mac packet.MAC) error {
 }
 
 func (e *Engine) ClearIPState(ip uint32) {
+	e.pendingProbeSendMu.Lock()
+	defer e.pendingProbeSendMu.Unlock()
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.clearStateLocked(ip)
+	e.mu.Unlock()
 }
 
 func (e *Engine) ClearAllState() {
+	e.pendingProbeSendMu.Lock()
+	defer e.pendingProbeSendMu.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.state = make(map[uint32]State)
 	e.stateAtime = make(map[uint32]int64)
 	e.stateMtime = make(map[uint32]int64)
 	e.pending = make(map[uint32]struct{})
+	e.cleared = make(map[uint32]struct{})
 	e.queue.ClearAll()
 	if e.cfg.SpongeNet {
 		e.setStateLocked(e.netIP, StateStatic, time.Now().Unix())
@@ -894,12 +1258,14 @@ func (e *Engine) ClearARP() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.arpTable = make(map[uint32]ArpEntry)
+	e.arpExpiry = make(map[int64]map[uint32]int64)
+	e.nextARPExpiry = 0
 }
 
 func (e *Engine) GetIPState(ip uint32) (IPState, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	state, ok := e.state[ip]
+	state, ok := e.effectiveStateLocked(ip)
 	if !ok {
 		return IPState{}, false
 	}
