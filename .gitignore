@@ -1,6 +1,6 @@
 # Binaries
-arpsponge
-arpspongectl
+/arpsponge
+/arpspongectl
 *.exe
 *.dll
 *.so
@@ -19,3 +19,6 @@ coverage*
 .DS_Store
 .vscode/
 .idea/
+
+# Local tooling state
+.tokensave/

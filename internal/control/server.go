@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"arpsponge/internal/engine"
 	"arpsponge/internal/netutil"
@@ -282,6 +283,11 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	// The daemon's HTTP server has a finite WriteTimeout for ordinary requests,
+	// but this endpoint intentionally stays open while clients follow logs.
+	// ResponseController reaches the underlying server response writer and
+	// clears that deadline without weakening the timeout for other endpoints.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")

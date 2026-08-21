@@ -71,7 +71,3 @@ func InNet(ip uint32, network uint32, prefixLen int) bool {
 	mask := uint32(0xffffffff) << (32 - prefixLen)
 	return (ip & mask) == (network & mask)
 }
-
-func Range(network uint32, broadcast uint32) (uint32, uint32) {
-	return network, broadcast
-}

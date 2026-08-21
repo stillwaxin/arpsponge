@@ -2,15 +2,31 @@ package control
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"arpsponge/internal/engine"
 	"arpsponge/internal/netutil"
 	"arpsponge/internal/packet"
 )
+
+type deadlineResponseRecorder struct {
+	*httptest.ResponseRecorder
+	deadline    time.Time
+	deadlineSet bool
+}
+
+func (r *deadlineResponseRecorder) SetWriteDeadline(deadline time.Time) error {
+	r.deadline = deadline
+	r.deadlineSet = true
+	return nil
+}
+
+func (r *deadlineResponseRecorder) Flush() {}
 
 type fakeSender struct{}
 
@@ -83,6 +99,72 @@ func TestServerConfigUpdate(t *testing.T) {
 	}
 	if got.LogLevel != "debug" {
 		t.Fatalf("expected log_level debug, got %s", got.LogLevel)
+	}
+}
+
+func TestServerConfigLearningUpdateRestartsLearningPeriod(t *testing.T) {
+	srv := newTestServer(t)
+	srv.engine.ForceLearning(0)
+	payload := map[string]any{"learning": 2}
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/config", mustJSON(t, payload))
+	srv.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.Code)
+	}
+
+	sourceIP, err := netutil.ParseIPv4String("10.0.0.7")
+	if err != nil {
+		t.Fatalf("parse source ip: %v", err)
+	}
+	targetIP, err := netutil.ParseIPv4String("10.0.0.8")
+	if err != nil {
+		t.Fatalf("parse target ip: %v", err)
+	}
+	arpRequest := packet.Packet{
+		SrcMAC:    packet.MustParseMAC("00:11:22:33:44:08"),
+		DstMAC:    packet.MustParseMAC("ff:ff:ff:ff:ff:ff"),
+		EtherType: packet.EtherTypeARP,
+		ARP: &packet.ARP{
+			Opcode:    packet.ARPOpRequest,
+			SenderMAC: packet.MustParseMAC("00:11:22:33:44:08"),
+			SenderIP:  sourceIP,
+			TargetIP:  targetIP,
+		},
+	}
+
+	srv.engine.Tick(time.Now())
+	srv.engine.HandlePacket(arpRequest)
+	if _, ok := srv.engine.GetIPState(targetIP); ok {
+		t.Fatal("ARP request was processed before the configured learning period ended")
+	}
+
+	srv.engine.Tick(time.Now())
+	srv.engine.HandlePacket(arpRequest)
+	state, ok := srv.engine.GetIPState(targetIP)
+	if !ok {
+		t.Fatal("ARP request was not processed after the configured learning period ended")
+	}
+	if state.State != "PENDING(0)" {
+		t.Fatalf("got state %s after learning period, want PENDING(0)", state.State)
+	}
+}
+
+func TestServerLogStreamClearsWriteDeadline(t *testing.T) {
+	srv := newTestServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder := &deadlineResponseRecorder{ResponseRecorder: httptest.NewRecorder()}
+	req := httptest.NewRequest(http.MethodGet, "/v1/log/stream", nil).WithContext(ctx)
+
+	srv.Handler().ServeHTTP(recorder, req)
+
+	if !recorder.deadlineSet {
+		t.Fatal("log stream did not clear the server write deadline")
+	}
+	if !recorder.deadline.IsZero() {
+		t.Fatalf("log stream write deadline = %s, want zero", recorder.deadline)
 	}
 }
 

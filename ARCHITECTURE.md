@@ -11,6 +11,10 @@ The system is split into four main pieces:
 
 The control API and engine are OS-agnostic. Linux-specific functionality is isolated under `internal/platform/linux` with `//go:build linux` and `// linux-only` breadcrumbs.
 
+## Platform Support
+
+The daemon is deliberately Linux-only: live capture and ARP injection require the Linux platform implementation. macOS is supported only as a portable build and test runner through the non-Linux stub; it cannot run the daemon. Windows builds are unsupported.
+
 ## Components
 
 ### Packet Capture (Linux)
@@ -53,9 +57,24 @@ The control API and engine are OS-agnostic. Linux-specific functionality is isol
 
 ## Concurrency Model
 
-- One goroutine runs pcap capture and dispatches packets to the engine.
-- A 1-second ticker drives periodic timers (pending probes, sweep).
-- Control API serves concurrently via Go’s HTTP server.
+- One goroutine runs packet capture and dispatches packets to the engine. A
+  1-second ticker calls `Engine.Tick`; it starts pending-probe and sweep work as
+  detached passes through `startPass`, so a slow pass does not block the ticker
+  or the other kind of pass.
+- `probeInProgress` and `sweepInProgress` independently prevent overlapping
+  pending-probe and sweep passes. They do not prevent one pending-probe pass and
+  one sweep pass from running at the same time.
+- When `--proberate` is positive, both pass types share `queryPacer`'s
+  aggregate query budget; zero disables pacing. Pending probes normally have
+  priority. A waiting sweep becomes eligible after ten current pacing
+  intervals; it still consumes the ordinary shared slot, and a pending grant
+  follows an aged-sweep grant when pending demand exists.
+- `Engine.Stop()` is the pass shutdown contract: it cancels the pass context and
+  waits for `passWG`. In `main`, cleanup cancels capture, calls `Engine.Stop()`,
+  waits for the capture goroutine, and then calls `capture.Close()`. Calling
+  `Engine.Stop()` before `capture.Close()` ensures no pass can use the capture
+  after it is closed.
+- The control API serves concurrently via Go’s HTTP server.
 
 ## Configuration
 
@@ -68,6 +87,7 @@ The control API and engine are OS-agnostic. Linux-specific functionality is isol
 - `internal/platform/linux/pcap.go`: capture + injection.
 - `internal/platform/linux/socket.go`: Unix socket ownership/perms.
 
-## Archived Perl Implementation
+## Original Perl Implementation
 
-The original Perl architecture and docs are preserved under `archive/`.
+The original Perl architecture and documentation are available upstream at
+[github.com/AMS-IX/arpsponge](https://github.com/AMS-IX/arpsponge).

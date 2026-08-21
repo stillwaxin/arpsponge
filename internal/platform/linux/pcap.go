@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"sync"
 	"time"
 
 	"arpsponge/internal/netutil"
@@ -19,6 +20,7 @@ import (
 // linux-only: uses libpcap for capture and injection.
 type Capture struct {
 	handle *pcap.Handle
+	sendMu sync.Mutex
 }
 
 func OpenCapture(device string, snaplen int, promisc bool, timeout time.Duration) (*Capture, error) {
@@ -34,8 +36,11 @@ func OpenCapture(device string, snaplen int, promisc bool, timeout time.Duration
 }
 
 func (c *Capture) Close() {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	if c.handle != nil {
 		c.handle.Close()
+		c.handle = nil
 	}
 }
 
@@ -58,6 +63,8 @@ func (c *Capture) Run(ctx context.Context, handler func(packet.Packet)) error {
 }
 
 func (c *Capture) SendARP(arp packet.ARP, srcMAC packet.MAC, dstMAC packet.MAC) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	if c.handle == nil {
 		return errors.New("pcap handle not open")
 	}
