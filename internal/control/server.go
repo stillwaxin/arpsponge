@@ -291,6 +291,9 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	// Flush the response headers before waiting for the next log entry so an
+	// idle stream completes the client's bounded header handshake.
+	_ = http.NewResponseController(w).Flush()
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {

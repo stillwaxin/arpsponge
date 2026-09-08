@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -165,6 +167,78 @@ func TestServerLogStreamClearsWriteDeadline(t *testing.T) {
 	}
 	if !recorder.deadline.IsZero() {
 		t.Fatalf("log stream write deadline = %s, want zero", recorder.deadline)
+	}
+}
+
+func TestServerLogStreamFlushesInitialHeaders(t *testing.T) {
+	srv := httptest.NewServer(newTestServer(t).Handler())
+	defer srv.Close()
+
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Get(srv.URL + "/v1/log/stream")
+	if err != nil {
+		t.Fatalf("open idle log stream: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Fatalf("stream content type = %q, want text/event-stream", got)
+	}
+}
+
+func TestServerConfigRejectsInvalidUpdatesAtomically(t *testing.T) {
+	for _, body := range []string{
+		`{"queue_depth":0}`,
+		`{"max_rate":-1}`,
+		`{"arp_age":-1}`,
+		`{"max_pending":-1}`,
+		`{"proberate":-1}`,
+		`{"flood_protection":-1}`,
+		`{"learning":-1}`,
+		`{"sweep_period":-1}`,
+		`{"sweep_age":-1}`,
+		`{"arp_age":9223372037}`,
+		`{"learning":9223372037}`,
+		`{"sweep_period":9223372037}`,
+		`{"sweep_age":9223372037}`,
+		`{"max_pending":0,"max_rate":-1}`,
+		`{"max_rate":NaN}`,
+		`{"max_rate":1e9999}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			srv := newTestServer(t)
+			before := srv.engine.Config()
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(body))
+			srv.Handler().ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			if after := srv.engine.Config(); !reflect.DeepEqual(after, before) {
+				t.Fatalf("invalid update changed config: got %#v, want %#v", after, before)
+			}
+		})
+	}
+}
+
+func TestServerConfigAcceptsExplicitZeroAndFalse(t *testing.T) {
+	srv := newTestServer(t)
+	setTrue := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(setTrue, httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(`{"passive":true}`)))
+	if setTrue.Code != http.StatusOK || !srv.engine.Config().Passive {
+		t.Fatalf("could not establish passive=true before explicit false: %d %s", setTrue.Code, setTrue.Body.String())
+	}
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(`{"max_pending":0,"proberate":0,"learning":0,"passive":false}`))
+	srv.Handler().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	cfg := srv.engine.Config()
+	if cfg.MaxPending != 0 || cfg.Proberate != 0 || cfg.LearnSeconds != 0 || cfg.Passive {
+		t.Fatalf("config = %#v, want explicit zero/false update", cfg)
 	}
 }
 
