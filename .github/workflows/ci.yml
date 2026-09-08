@@ -1,0 +1,32 @@
+name: Go verification
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Install libpcap headers
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+      - name: Test
+        run: go test ./...
+      - name: Race detector
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: go build ./...
+      - name: Verify idle capture cancellation with privileges
+        run: |
+          go test -race -c -o /tmp/arpsponge-capture.test ./internal/platform/linux
+          sudo env ARPSPONGE_TEST_LIVE_CAPTURE=1 /tmp/arpsponge-capture.test -test.v -test.run '^TestLiveCaptureIdleCancellation$' -test.timeout 15s

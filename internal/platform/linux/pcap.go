@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -20,7 +21,12 @@ import (
 // linux-only: uses libpcap for capture and injection.
 type Capture struct {
 	handle *pcap.Handle
+	reader packetReader
 	sendMu sync.Mutex
+}
+
+type packetReader interface {
+	NextPacket() (gopacket.Packet, error)
 }
 
 func OpenCapture(device string, snaplen int, promisc bool, timeout time.Duration) (*Capture, error) {
@@ -45,19 +51,27 @@ func (c *Capture) Close() {
 }
 
 func (c *Capture) Run(ctx context.Context, handler func(packet.Packet)) error {
-	source := gopacket.NewPacketSource(c.handle, c.handle.LinkType())
+	reader := c.reader
+	if reader == nil {
+		reader = gopacket.NewPacketSource(c.handle, c.handle.LinkType())
+	}
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return ctx.Err()
-		case pkt, ok := <-source.Packets():
-			if !ok {
-				return errors.New("pcap source closed")
-			}
-			decoded, ok := decodePacket(pkt)
-			if ok {
-				handler(decoded)
-			}
+		}
+		pkt, err := reader.NextPacket()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if errors.Is(err, pcap.NextErrorTimeoutExpired) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read packet: %w", err)
+		}
+		decoded, ok := decodePacket(pkt)
+		if ok {
+			handler(decoded)
 		}
 	}
 }

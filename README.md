@@ -79,9 +79,13 @@ create an inode-lock race.
 Control socket default path:
 - `/run/arpsponge/<interface>/control.sock`
 
-At startup, an existing Unix socket at that path is replaced. A directory,
-regular file, symlink, or other non-socket node is preserved and causes startup
-to fail instead of being deleted.
+At startup, the daemon takes an exclusive sidecar lock for its control socket
+and holds it until shutdown. A second daemon using the same socket path fails
+without replacing the active listener. An existing socket is replaced only
+after a bounded connection probe shows it is stale; a live or uncertain socket
+causes startup to fail. A directory, regular file, symlink, or other
+non-socket node is preserved and also causes startup to fail instead of being
+deleted.
 
 ## Security
 

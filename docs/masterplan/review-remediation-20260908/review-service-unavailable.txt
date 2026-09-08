@@ -1,0 +1,6 @@
+Cross-vendor adversary service unavailable in this Codex host.
+Observed command failure: rtk proxy agent-dispatch where -> Failed to execute command: agent-dispatch: No such file or directory (os error 2).
+/srv/workflows/policy/dispatch.md and /srv/workflows/policy/workflow-map.json are absent.
+Tool inventory search for dispatch/adversary/breaker returned no tools.
+Native collaboration exposes OpenAI models only; cannot claim a cross-vendor panel or fabricate its provenance/token receipts.
+Use available native subagents for independent planning and code review; disclose the unavailable cross-vendor stage.

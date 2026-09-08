@@ -2,15 +2,131 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"arpsponge/internal/engine"
+	"arpsponge/internal/packet"
 )
+
+type lifecycleCapture struct {
+	canceled chan struct{}
+	release  chan struct{}
+	closed   chan struct{}
+}
+
+func (c *lifecycleCapture) Run(ctx context.Context, _ func(packet.Packet)) error {
+	<-ctx.Done()
+	close(c.canceled)
+	<-c.release
+	return ctx.Err()
+}
+func (c *lifecycleCapture) Close() { close(c.closed) }
+
+func TestCaptureShutdownJoinsAllUsersBeforeClose(t *testing.T) {
+	capture := &lifecycleCapture{make(chan struct{}), make(chan struct{}), make(chan struct{})}
+	engineStopping, engineStopped := make(chan struct{}), make(chan struct{})
+	worker := newCaptureWorker(capture, func(packet.Packet) {}, func() { close(engineStopping); <-engineStopped })
+	worker.Start()
+	shutdown := make(chan struct{})
+	go func() { worker.Stop(); close(shutdown) }()
+	select {
+	case <-capture.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("capture not canceled")
+	}
+	select {
+	case <-engineStopping:
+	case <-time.After(time.Second):
+		t.Fatal("engine not stopped")
+	}
+	select {
+	case <-capture.closed:
+		t.Fatal("capture closed before engine stopped")
+	default:
+	}
+	close(engineStopped)
+	select {
+	case <-capture.closed:
+		t.Fatal("capture closed before reader joined")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(capture.release)
+	select {
+	case <-shutdown:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not join capture")
+	}
+	select {
+	case <-capture.closed:
+	default:
+		t.Fatal("capture not closed after workers joined")
+	}
+	worker.Stop()
+}
+
+func TestCaptureSetupFailureClosesHandleWithoutStartingReader(t *testing.T) {
+	capture := &lifecycleCapture{make(chan struct{}), make(chan struct{}), make(chan struct{})}
+	engineStopped := false
+	worker := newCaptureWorker(capture, func(packet.Packet) { t.Error("handler ran before setup completed") }, func() { engineStopped = true })
+	// A failed listener or permission setup runs deferred cleanup before Start.
+	done := make(chan struct{})
+	go func() { worker.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup waited for an unstarted reader")
+	}
+	if !engineStopped {
+		t.Fatal("engine cleanup skipped")
+	}
+	select {
+	case <-capture.closed:
+	default:
+		t.Fatal("unstarted handle was not closed")
+	}
+	select {
+	case <-capture.canceled:
+		t.Fatal("reader ran before successful setup")
+	default:
+	}
+	worker.Start()
+	worker.mu.Lock()
+	started := worker.started
+	worker.mu.Unlock()
+	if started {
+		t.Fatal("reader started after failed setup closed its handle")
+	}
+}
+
+func TestDaemonSupervisesCaptureCompletion(t *testing.T) {
+	failure := errors.New("terminal capture failure")
+	for _, result := range []error{failure, nil} {
+		captureErrors := make(chan error, 1)
+		captureErrors <- result
+		err := superviseDaemon(nil, nil, captureErrors, nil, func(time.Time) {}, func() {})
+		if err == nil || !strings.Contains(err.Error(), "capture") {
+			t.Fatalf("unexpected capture result %v returned %v", result, err)
+		}
+		if result != nil && !errors.Is(err, failure) {
+			t.Fatalf("capture error not preserved: %v", err)
+		}
+	}
+}
+
+func TestDaemonSupervisionPreservesSignalShutdown(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	signals <- os.Interrupt
+	if err := superviseDaemon(nil, nil, nil, signals, func(time.Time) {}, func() {}); err != nil {
+		t.Fatalf("signal shutdown: %v", err)
+	}
+}
 
 func TestNewControlHTTPServerSetsFiniteTimeouts(t *testing.T) {
 	srv := newControlHTTPServer(http.NotFoundHandler())

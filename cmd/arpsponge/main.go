@@ -2,19 +2,16 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"arpsponge/internal/cliargs"
@@ -127,19 +124,6 @@ func runWithIO(args []string, stdout io.Writer, stderr io.Writer) (runErr error)
 		return err
 	}
 
-	ifaceInfo, err := linux.GetInterfaceInfo(iface)
-	if err != nil {
-		return fmt.Errorf("interface error: %w", err)
-	}
-	myMAC := ifaceInfo.MAC
-	if *flagMAC != "" {
-		overrideMAC, err := packet.ParseMAC(*flagMAC)
-		if err != nil {
-			return fmt.Errorf("invalid mac: %w", err)
-		}
-		myMAC = overrideMAC
-	}
-
 	logLevel, err := engine.ParseLogLevel(*flagLogLevel)
 	if err != nil {
 		return err
@@ -173,6 +157,22 @@ func runWithIO(args []string, stdout io.Writer, stderr io.Writer) (runErr error)
 	cfg.SweepAge = sweepAge
 	cfg.SweepSkipAlive = *flagSweepSkipAlive
 	cfg.ArpUpdateFlags = updateFlags
+	if err := engine.ValidateConfig(cfg); err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+
+	ifaceInfo, err := linux.GetInterfaceInfo(iface)
+	if err != nil {
+		return fmt.Errorf("interface error: %w", err)
+	}
+	myMAC := ifaceInfo.MAC
+	if *flagMAC != "" {
+		overrideMAC, err := packet.ParseMAC(*flagMAC)
+		if err != nil {
+			return fmt.Errorf("invalid mac: %w", err)
+		}
+		myMAC = overrideMAC
+	}
 
 	var pidFile *pidFile
 	if *flagPidfile != "" {
@@ -193,14 +193,8 @@ func runWithIO(args []string, stdout io.Writer, stderr io.Writer) (runErr error)
 	}
 
 	eng := engine.New(cfg, iface, netCIDR, netIP, broadcast, prefixLen, ifaceInfo.PrimaryIP, myMAC, ifaceInfo.AllIPs, capture, logger)
-	ctx, cancel := context.WithCancel(context.Background())
-	var captureWG sync.WaitGroup
-	defer func() {
-		cancel()
-		eng.Stop()
-		captureWG.Wait()
-		capture.Close()
-	}()
+	worker := newCaptureWorker(capture, eng.HandlePacket, eng.Stop)
+	defer worker.Stop()
 	if *flagSweepAtStart {
 		eng.SetSweepAtStart()
 	}
@@ -233,12 +227,7 @@ func runWithIO(args []string, stdout io.Writer, stderr io.Writer) (runErr error)
 	go func() {
 		serverErrs <- httpServer.Serve(listener)
 	}()
-
-	captureWG.Add(1)
-	go func() {
-		defer captureWG.Done()
-		_ = capture.Run(ctx, eng.HandlePacket)
-	}()
+	worker.Start()
 
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -247,25 +236,11 @@ func runWithIO(args []string, stdout io.Writer, stderr io.Writer) (runErr error)
 	signal.Notify(sigs, signalSet()...)
 	defer signal.Stop(sigs)
 
-	for {
-		select {
-		case <-ticker.C:
-			eng.Tick(time.Now())
-		case err := <-serverErrs:
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				return fmt.Errorf("control server: %w", err)
-			}
-			return nil
-		case sig := <-sigs:
-			if isDumpSignal(sig) {
-				if *flagStatusFile != "" {
-					_ = dumpStatus(*flagStatusFile, eng)
-				}
-				continue
-			}
-			return
+	return superviseDaemon(ticker.C, serverErrs, worker.errors, sigs, eng.Tick, func() {
+		if *flagStatusFile != "" {
+			_ = dumpStatus(*flagStatusFile, eng)
 		}
-	}
+	})
 }
 
 func parseInitState(s string) (engine.State, error) {
@@ -299,8 +274,11 @@ func parseSweep(spec string) (int, int, error) {
 	if err != nil {
 		return 0, 0, fmt.Errorf("invalid sweep age %q: %w", parts[1], err)
 	}
-	if period < 0 || age < 0 {
-		return 0, 0, fmt.Errorf("invalid sweep %q: period and age must be >= 0", spec)
+	if period < 0 {
+		return 0, 0, fmt.Errorf("invalid sweep_period: must be >= 0")
+	}
+	if age < 0 {
+		return 0, 0, fmt.Errorf("invalid sweep_age: must be >= 0")
 	}
 	return period, age, nil
 }
