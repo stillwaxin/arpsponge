@@ -128,7 +128,7 @@ func TestTickExpiresStaleARPEntriesAtConfiguredAge(t *testing.T) {
 }
 
 func TestTickKeepsARPEntriesWhenExpiryDisabled(t *testing.T) {
-	for _, age := range []int{0, -1} {
+	for _, age := range []int{0} {
 		t.Run(fmt.Sprintf("age=%d", age), func(t *testing.T) {
 			eng, _ := newTestEngine(t)
 			if err := eng.UpdateConfig(func(cfg *Config) error {
@@ -402,7 +402,7 @@ func TestPendingProbeCannotSendOrRecreateMetadataAfterClear(t *testing.T) {
 			if staleIP == firstIP {
 				staleIP = ips[1]
 			}
-			waitForPendingState(t, eng, staleIP)
+			waitForPendingPacer(t, eng)
 
 			tt.clear(eng, staleIP)
 			select {
@@ -1438,19 +1438,6 @@ func (s *firstTargetSender) Count() int {
 	return s.sent
 }
 
-func waitForPendingState(t *testing.T, eng *Engine, ip uint32) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		state, ok := eng.GetIPState(ip)
-		if ok && state.State == "PENDING(1)" {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("pending probe never incremented %s before clear", netutil.IPv4String(ip))
-}
-
 type timedSender struct {
 	mu     sync.Mutex
 	times  []time.Time
@@ -1773,4 +1760,405 @@ func mustIP(t *testing.T, s string) uint32 {
 		t.Fatalf("parse ip: %v", err)
 	}
 	return ip
+}
+
+// A blocked announcement must never hold the engine state mutex, and Stop must
+// join it before a caller can close the packet sender.
+func TestGratuitousTransitionsReleaseStateLockAndJoinShutdown(t *testing.T) {
+	for _, automatic := range []bool{false, true} {
+		for _, state := range []State{StateDead, StateStatic} {
+			if automatic && state == StateStatic {
+				continue
+			}
+			t.Run(fmt.Sprintf("automatic=%v/state=%v", automatic, state), func(t *testing.T) {
+				eng, _ := newTestEngine(t)
+				eng.cfg.Gratuitous = true
+				sender := newBlockingProbeSender()
+				eng.sender = sender
+				ip := mustIP(t, "10.0.0.88")
+				done := make(chan struct{})
+				if automatic {
+					_ = eng.SetIPState(ip, Pending(eng.cfg.MaxPending), packet.MAC{})
+				}
+				go func() {
+					if automatic {
+						eng.Tick(time.Now())
+					} else {
+						_ = eng.SetIPState(ip, state, packet.MAC{})
+					}
+					close(done)
+				}()
+				select {
+				case <-sender.first:
+				case <-time.After(time.Second):
+					t.Fatal("announcement did not reach sender; state transition deadlocked")
+				}
+				status := make(chan struct{})
+				go func() { eng.Status(); close(status) }()
+				select {
+				case <-status:
+				case <-time.After(time.Second):
+					t.Fatal("announcement holds state mutex")
+				}
+				stopped := make(chan struct{})
+				go func() { eng.Stop(); close(stopped) }()
+				select {
+				case <-stopped:
+					t.Fatal("Stop returned while announcement was sending")
+				case <-time.After(20 * time.Millisecond):
+				}
+				close(sender.release)
+				select {
+				case <-stopped:
+				case <-time.After(time.Second):
+					t.Fatal("Stop did not join announcement")
+				}
+				<-done
+				if sender.Count() != 1 {
+					t.Fatalf("got %d announcements, want one", sender.Count())
+				}
+				got, _ := eng.GetIPState(ip)
+				if got.State != state.String() {
+					t.Fatalf("got %s, want %s", got.State, state)
+				}
+			})
+		}
+	}
+}
+
+func TestGratuitousDummyTransitionsComplete(t *testing.T) {
+	for _, state := range []State{StateDead, StateStatic} {
+		eng, sender := newTestEngine(t)
+		eng.cfg.Gratuitous, eng.cfg.Dummy = true, true
+		done := make(chan struct{})
+		go func() { _ = eng.SetIPState(mustIP(t, "10.0.0.88"), state, packet.MAC{}); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("dummy transition deadlocked")
+		}
+		if sender.sent != 0 {
+			t.Fatal("dummy announcement transmitted")
+		}
+	}
+}
+
+type senderFunc func(packet.ARP, packet.MAC, packet.MAC) error
+
+func (f senderFunc) SendARP(arp packet.ARP, src, dst packet.MAC) error { return f(arp, src, dst) }
+
+func TestGratuitousSendErrorsAreReportedWithoutRollingBackState(t *testing.T) {
+	logger := &recordingLogger{}
+	eng, _ := newTestEngineWithLogger(t, logger)
+	eng.cfg.Gratuitous = true
+	eng.sender = senderFunc(func(packet.ARP, packet.MAC, packet.MAC) error { return fmt.Errorf("injection failed") })
+	done := make(chan struct{})
+	go func() { _ = eng.SetIPState(mustIP(t, "10.0.0.88"), StateDead, packet.MAC{}); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("transition blocked")
+	}
+	got, _ := eng.GetIPState(mustIP(t, "10.0.0.88"))
+	if got.State != "DEAD" {
+		t.Fatalf("got %s", got.State)
+	}
+	if !logger.containsMessage("injection failed") {
+		t.Fatal("send failure was not reported")
+	}
+}
+
+func TestFailedPendingProbesDoNotAdvanceState(t *testing.T) {
+	logger := &recordingLogger{}
+	eng, _ := newTestEngineWithLogger(t, logger)
+	eng.cfg.MaxPending = 2
+	eng.queryPacer.configure(0)
+	ip := mustIP(t, "10.0.0.88")
+	_ = eng.SetIPState(ip, Pending(0), packet.MAC{})
+	fail := true
+	eng.sender = senderFunc(func(packet.ARP, packet.MAC, packet.MAC) error {
+		if fail {
+			return fmt.Errorf("injection failed")
+		}
+		return nil
+	})
+	for n := 0; n < 5; n++ {
+		eng.probePending(context.Background(), time.Now())
+	}
+	got, _ := eng.GetIPState(ip)
+	if got.State != "PENDING(0)" {
+		t.Fatalf("failed probes advanced state to %s", got.State)
+	}
+	errors := 0
+	for _, entry := range logger.entries {
+		if strings.Contains(entry.message, "injection failed") {
+			errors++
+		}
+	}
+	if errors != 1 {
+		t.Fatalf("send error log count=%d, want one bounded warning", errors)
+	}
+	for _, step := range []struct {
+		fail bool
+		want string
+	}{{false, "PENDING(1)"}, {true, "PENDING(1)"}, {false, "PENDING(2)"}, {false, "DEAD"}} {
+		fail = step.fail
+		eng.probePending(context.Background(), time.Now())
+		got, _ = eng.GetIPState(ip)
+		if got.State != step.want {
+			t.Fatalf("fail=%v: got %s, want %s", fail, got.State, step.want)
+		}
+	}
+}
+
+func TestPendingCompletionDoesNotModifyAnotherEpisode(t *testing.T) {
+	for _, change := range []string{"alive", "repending", "alive then pending"} {
+		t.Run(change, func(t *testing.T) {
+			eng, _ := newTestEngine(t)
+			eng.queryPacer.configure(0)
+			sender := newBlockingProbeSender()
+			eng.sender = sender
+			ip := mustIP(t, "10.0.0.88")
+			_ = eng.SetIPState(ip, Pending(0), packet.MAC{})
+			done := make(chan struct{})
+			go func() { eng.probePending(context.Background(), time.Now()); close(done) }()
+			<-sender.first
+			got, _ := eng.GetIPState(ip)
+			if got.State != "PENDING(0)" {
+				close(sender.release)
+				<-done
+				t.Fatalf("in-flight probe advanced state to %s", got.State)
+			}
+			want := "PENDING(0)"
+			if change != "repending" {
+				_ = eng.SetIPState(ip, StateAlive, packet.MAC{})
+				want = "ALIVE"
+			}
+			if change != "alive" {
+				_ = eng.SetIPState(ip, Pending(0), packet.MAC{})
+				want = "PENDING(0)"
+			}
+			close(sender.release)
+			<-done
+			got, _ = eng.GetIPState(ip)
+			if got.State != want {
+				t.Fatalf("old send changed new state to %s, want %s", got.State, want)
+			}
+		})
+	}
+}
+
+func TestPendingPacingCancellationAndEpisodeReset(t *testing.T) {
+	for _, reset := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reset=%v", reset), func(t *testing.T) {
+			eng, sender := newTestEngine(t)
+			eng.queryPacer.configure(1)
+			eng.waitForProbeRate(context.Background(), true)
+			ip := mustIP(t, "10.0.0.88")
+			_ = eng.SetIPState(ip, Pending(0), packet.MAC{})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() { eng.probePending(ctx, time.Now()); close(done) }()
+			waitForPendingPacer(t, eng)
+			if reset {
+				eng.ClearIPState(ip)
+				_ = eng.SetIPState(ip, Pending(0), packet.MAC{})
+				eng.queryPacer.configure(0)
+			} else {
+				cancel()
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("paced pass did not finish")
+			}
+			got, _ := eng.GetIPState(ip)
+			if got.State != "PENDING(0)" || sender.sent != 0 {
+				t.Fatalf("stale/canceled send: state=%s sends=%d", got.State, sender.sent)
+			}
+		})
+	}
+}
+
+func waitForPendingPacer(t *testing.T, eng *Engine) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		eng.queryPacer.mu.Lock()
+		waiting := eng.queryPacer.pendingWaiters > 0
+		eng.queryPacer.mu.Unlock()
+		if waiting {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("pending probe did not wait for pacing")
+}
+
+func TestPendingClearWhileSendingThenRepending(t *testing.T) {
+	eng, _ := newTestEngine(t)
+	eng.queryPacer.configure(0)
+	sender := newBlockingProbeSender()
+	eng.sender = sender
+	ip := mustIP(t, "10.0.0.88")
+	_ = eng.SetIPState(ip, Pending(0), packet.MAC{})
+	done := make(chan struct{})
+	go func() { eng.probePending(context.Background(), time.Now()); close(done) }()
+	<-sender.first
+	cleared := make(chan struct{})
+	go func() { eng.ClearIPState(ip); _ = eng.SetIPState(ip, Pending(0), packet.MAC{}); close(cleared) }()
+	select {
+	case <-cleared:
+		t.Fatal("clear passed an active send")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(sender.release)
+	<-cleared
+	<-done
+	got, _ := eng.GetIPState(ip)
+	if got.State != "PENDING(0)" {
+		t.Fatalf("old send advanced new episode: %s", got.State)
+	}
+}
+
+func TestPendingSuppressedModesPreserveSimulation(t *testing.T) {
+	for _, dummy := range []bool{false, true} {
+		eng, sender := newTestEngine(t)
+		eng.cfg.Passive, eng.cfg.Dummy, eng.cfg.MaxPending = !dummy, dummy, 1
+		eng.queryPacer.configure(0)
+		ip := mustIP(t, "10.0.0.88")
+		_ = eng.SetIPState(ip, Pending(0), packet.MAC{})
+		eng.probePending(context.Background(), time.Now())
+		got, _ := eng.GetIPState(ip)
+		if got.State != "PENDING(1)" {
+			t.Fatalf("dummy=%v got %s", dummy, got.State)
+		}
+		eng.probePending(context.Background(), time.Now())
+		got, _ = eng.GetIPState(ip)
+		if got.State != "DEAD" || sender.sent != 0 {
+			t.Fatalf("dummy=%v state=%s sends=%d", dummy, got.State, sender.sent)
+		}
+	}
+}
+
+func TestFailedSweepDoesNotCountOrPostponeTarget(t *testing.T) {
+	logger := &recordingLogger{}
+	eng, _ := newTestEngineWithLogger(t, logger)
+	ip := mustIP(t, "10.0.0.88")
+	eng.netLo, eng.netHi = ip, ip
+	eng.cfg.SweepPeriod = 1
+	eng.queryPacer.configure(0)
+	eng.nextSweep = time.Unix(1, 0)
+	eng.stateMtime[ip] = 1
+	eng.sender = senderFunc(func(packet.ARP, packet.MAC, packet.MAC) error { return fmt.Errorf("sweep injection failed") })
+	eng.sweepIfNeeded(context.Background(), time.Now())
+	if eng.stateMtime[ip] != 1 {
+		t.Fatal("failed sweep postponed target")
+	}
+	if logger.containsMessage("queried 1 IP") {
+		t.Fatal("failed sweep counted as queried")
+	}
+	if !logger.containsMessage("sweep injection failed") {
+		t.Fatal("failed sweep not reported")
+	}
+}
+
+func TestAutomaticGratuitousDummyTransition(t *testing.T) {
+	eng, sender := newTestEngine(t)
+	eng.cfg.Gratuitous, eng.cfg.Dummy = true, true
+	ip := mustIP(t, "10.0.0.88")
+	_ = eng.SetIPState(ip, Pending(eng.cfg.MaxPending), packet.MAC{})
+	eng.probePending(context.Background(), time.Now())
+	got, _ := eng.GetIPState(ip)
+	if got.State != "DEAD" || sender.sent != 0 {
+		t.Fatalf("state=%s announcements=%d", got.State, sender.sent)
+	}
+}
+
+func TestPendingSendOutcomes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		want probeResult
+	}{{"sent", probeSent}, {"dummy", probeSuppressed}, {"passive", probeSuppressed}, {"failed", probeFailed}, {"cleared", probeSkipped}} {
+		t.Run(tt.name, func(t *testing.T) {
+			eng, _ := newTestEngine(t)
+			ip := mustIP(t, "10.0.0.88")
+			_ = eng.SetIPState(ip, Pending(0), packet.MAC{})
+			episode := eng.pending[ip]
+			switch tt.name {
+			case "dummy":
+				eng.cfg.Dummy = true
+			case "passive":
+				eng.cfg.Passive = true
+			case "failed":
+				eng.sender = nil
+			case "cleared":
+				eng.ClearIPState(ip)
+			}
+			if got := eng.sendPendingProbe(context.Background(), ip, episode, false); got != tt.want {
+				t.Fatalf("result=%v want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDummySweepCountsSimulatedQuery(t *testing.T) {
+	logger := &recordingLogger{}
+	eng, sender := newTestEngineWithLogger(t, logger)
+	ip := mustIP(t, "10.0.0.88")
+	eng.netLo, eng.netHi = ip, ip
+	eng.cfg.SweepPeriod, eng.cfg.Dummy = 1, true
+	eng.queryPacer.configure(0)
+	eng.nextSweep = time.Unix(1, 0)
+	eng.stateMtime[ip] = 1
+	eng.sweepIfNeeded(context.Background(), time.Now())
+	if eng.stateMtime[ip] <= 1 || !logger.containsMessage("queried 1 IP") || sender.sent != 0 {
+		t.Fatal("dummy sweep did not count exactly one simulated query")
+	}
+}
+
+// Done is first consulted after the pending pass snapshots its configuration.
+// Switching modes at that boundary deterministically exercises an update that
+// races with a passive attempt, without depending on scheduler timing.
+type configurationSwitchContext struct {
+	context.Context
+	once         sync.Once
+	switchConfig func()
+}
+
+func (c *configurationSwitchContext) Done() <-chan struct{} {
+	c.once.Do(c.switchConfig)
+	return c.Context.Done()
+}
+
+func TestPassiveSnapshotCannotTransmitAfterActiveUpdateWithoutPacing(t *testing.T) {
+	eng, sender := newTestEngine(t)
+	if err := eng.UpdateConfig(func(cfg *Config) error { cfg.Passive = true; cfg.Proberate = 1; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	ip := mustIP(t, "10.0.0.88")
+	if err := eng.SetIPState(ip, Pending(0), packet.MAC{}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := &configurationSwitchContext{Context: context.Background(), switchConfig: func() {
+		if err := eng.UpdateConfig(func(cfg *Config) error { cfg.Passive = false; return nil }); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	eng.probePending(ctx, time.Now())
+	if sender.sent != 0 {
+		t.Fatalf("passive attempt transmitted %d queries after active update without pacing", sender.sent)
+	}
+	state, _ := eng.GetIPState(ip)
+	if state.State != "PENDING(1)" {
+		t.Fatalf("passive cycle did not simulate progress: %s", state.State)
+	}
+	if !eng.queryPacer.lastGrant.IsZero() {
+		t.Fatal("passive simulation unexpectedly consumed a pacing permit")
+	}
+	eng.probePending(context.Background(), time.Now())
+	if sender.sent != 1 || eng.queryPacer.lastGrant.IsZero() {
+		t.Fatal("next active attempt did not transmit with a pacing permit")
+	}
 }

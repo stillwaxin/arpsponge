@@ -95,3 +95,12 @@ func TestQueueReduce(t *testing.T) {
 		})
 	}
 }
+
+func TestQueueReduceTinyRateDoesNotOverflow(t *testing.T) {
+	q := NewQueue(10)
+	q.Add(1, 2, time.Unix(0, 0))
+	q.Add(1, 2, time.Unix(1, 0))
+	if got := q.Reduce(1, math.SmallestNonzeroFloat64); got != 1 {
+		t.Fatalf("tiny flood rate retained %d entries, want 1", got)
+	}
+}

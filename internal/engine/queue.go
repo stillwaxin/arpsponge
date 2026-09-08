@@ -87,7 +87,7 @@ func (q *Queue) Reduce(ip uint32, maxRate float64) int {
 	if maxRate <= 0 {
 		return len(entries)
 	}
-	minDelta := time.Duration(float64(time.Second) / maxRate)
+	minDelta := rateInterval(maxRate)
 	if minDelta <= 0 {
 		return len(entries)
 	}

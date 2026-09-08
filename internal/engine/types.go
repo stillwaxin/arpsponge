@@ -161,10 +161,6 @@ func ParseEventMask(spec string, current EventMask) (EventMask, error) {
 			value = EventAll
 			negate = !negate
 		}
-		if part == "all" {
-			mask = EventAll
-			continue
-		}
 		if negate {
 			mask &^= value
 			continue
