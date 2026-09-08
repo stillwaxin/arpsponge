@@ -1,0 +1,121 @@
+{
+  "schema_version": "6.0",
+  "meta": {
+    "purpose": "Resolve all eight September 8 review findings with regression coverage and verified portable and Linux behavior.",
+    "problem": "Engine locking and accounting, capture termination, socket replacement, log following, and configuration validation have defects.",
+    "solution": "Use disjoint component ownership in two waves, shared validation, and independent integrated review."
+  },
+  "tasks": [
+    {
+      "id": 1,
+      "description": "Design and implement engine fixes for R1, R2, R6, and R8, preserving locking, pending-episode identity, pacing fairness, configuration atomicity, and shutdown guarantees.",
+      "wave": 0,
+      "files": [
+        "internal/engine/engine.go",
+        "internal/engine/engine_test.go",
+        "internal/engine/types.go",
+        "internal/engine/types_test.go",
+        "internal/engine/status.go",
+        "internal/engine/queue.go",
+        "internal/engine/queue_test.go",
+        "internal/engine/config.go",
+        "internal/engine/config_test.go"
+      ],
+      "verify_commands": [
+        "go test ./internal/engine/...",
+        "go test -race ./internal/engine/...",
+        "git diff --check"
+      ],
+      "codex": "no",
+      "sensitive": true,
+      "goals": [
+        "G1",
+        "G2",
+        "G3",
+        "G4"
+      ]
+    },
+    {
+      "id": 2,
+      "description": "Implement R4 exclusive control-socket ownership with a persistent sidecar lock, conservative stale recovery, safe listener cleanup, filesystem regressions, and updated README behavior.",
+      "wave": 0,
+      "files": [
+        "internal/platform/unixsocket/socket.go",
+        "internal/platform/unixsocket/socket_test.go",
+        "README.md"
+      ],
+      "verify_commands": [
+        "go test ./internal/platform/unixsocket/...",
+        "go test -race ./internal/platform/unixsocket/...",
+        "git diff --check"
+      ],
+      "codex": "no",
+      "sensitive": true,
+      "goals": [
+        "G1",
+        "G2",
+        "G3",
+        "G4"
+      ]
+    },
+    {
+      "id": 3,
+      "description": "Implement R5 streaming log-follow behavior and R7 explicit CLI argument validation; add R6 HTTP rejection and atomic-update coverage using the engine validator from task 1.",
+      "wave": 1,
+      "files": [
+        "cmd/arpspongectl/main.go",
+        "cmd/arpspongectl/main_test.go",
+        "internal/control/server.go",
+        "internal/control/server_test.go",
+        "internal/control/log.go"
+      ],
+      "verify_commands": [
+        "go test ./cmd/arpspongectl/... ./internal/control/...",
+        "go test -race ./cmd/arpspongectl/... ./internal/control/...",
+        "git diff --check"
+      ],
+      "codex": "no",
+      "sensitive": true,
+      "goals": [
+        "G1",
+        "G2",
+        "G3",
+        "G4"
+      ]
+    },
+    {
+      "id": 4,
+      "description": "Design and implement R3 tracked capture supervision and safe shutdown, integrate R6 startup validation from task 1, and add Linux libpcap CI with capture cancellation regression coverage.",
+      "wave": 1,
+      "files": [
+        "cmd/arpsponge/main.go",
+        "cmd/arpsponge/main_test.go",
+        "cmd/arpsponge/lifecycle.go",
+        "cmd/arpsponge/lifecycle_test.go",
+        "internal/cliargs/daemon.go",
+        "internal/cliargs/daemon_test.go",
+        "internal/platform/linux/pcap.go",
+        "internal/platform/linux/pcap_test.go",
+        "internal/platform/linux/stub.go",
+        "internal/platform/linux/stub_test.go",
+        ".github/workflows/ci.yml"
+      ],
+      "verify_commands": [
+        "go test ./cmd/arpsponge/... ./internal/cliargs/... ./internal/platform/linux/...",
+        "go test -race ./cmd/arpsponge/... ./internal/cliargs/... ./internal/platform/linux/...",
+        "git diff --check"
+      ],
+      "codex": "no",
+      "sensitive": true,
+      "goals": [
+        "G1",
+        "G2",
+        "G3",
+        "G4",
+        "G5"
+      ]
+    }
+  ],
+  "plan_hash": "sha256:fd61ec5a1928e651ef26a8d14d1fc07728feca1f293c7e99d83300b9843a97f7",
+  "generated_at": "2026-09-08T13:51:24.770Z"
+}

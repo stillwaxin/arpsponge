@@ -2,7 +2,7 @@
 schema_version: 9
 slug: review-remediation-20260908
 status: in-progress
-phase: plan
+phase: execute
 topic: "full read the recent review and perform remediation, use sub-agents as needed and determine which model to use based on your own judgement"
 complexity: complex
 complexity_source: null
@@ -13,7 +13,7 @@ predecessor_transcript: null
 spec_path: /Volumes/CaseSensitive/git/arpsponge/docs/masterplan/review-remediation-20260908/spec.md
 plan_path: /Volumes/CaseSensitive/git/arpsponge/docs/masterplan/review-remediation-20260908/plan.md
 plan_index_path: /Volumes/CaseSensitive/git/arpsponge/docs/masterplan/review-remediation-20260908/plan.index.json
-tasks: []
+tasks: [{"id":1,"status":"pending","wave":0,"files":["internal/engine/engine.go","internal/engine/engine_test.go","internal/engine/types.go","internal/engine/types_test.go","internal/engine/status.go","internal/engine/queue.go","internal/engine/queue_test.go","internal/engine/config.go","internal/engine/config_test.go"]},{"id":2,"status":"pending","wave":0,"files":["internal/platform/unixsocket/socket.go","internal/platform/unixsocket/socket_test.go","README.md"]},{"id":3,"status":"pending","wave":1,"files":["cmd/arpspongectl/main.go","cmd/arpspongectl/main_test.go","internal/control/server.go","internal/control/server_test.go","internal/control/log.go"]},{"id":4,"status":"pending","wave":1,"files":["cmd/arpsponge/main.go","cmd/arpsponge/main_test.go","cmd/arpsponge/lifecycle.go","cmd/arpsponge/lifecycle_test.go","internal/cliargs/daemon.go","internal/cliargs/daemon_test.go","internal/platform/linux/pcap.go","internal/platform/linux/pcap_test.go","internal/platform/linux/stub.go","internal/platform/linux/stub_test.go",".github/workflows/ci.yml"]}]
 active_run: null
 pending_gate: null
 goals_enabled: true
