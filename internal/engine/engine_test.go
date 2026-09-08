@@ -725,6 +725,15 @@ func TestSweepDoesNotStarvePendingProbes(t *testing.T) {
 	case <-time.After(800 * time.Millisecond):
 		t.Fatal("in-flight sweep prevented pending probe pass")
 	}
+	// The sender signals before SendARP returns. Probe accounting is committed
+	// only after a successful return, so join the pass before inspecting it.
+	deadline := time.Now().Add(time.Second)
+	for eng.probeInProgress.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if eng.probeInProgress.Load() {
+		t.Fatal("pending probe pass did not finish after transmission")
+	}
 	state, ok := eng.GetIPState(pendingIP)
 	if !ok || state.State != "PENDING(1)" {
 		t.Fatalf("pending state during sweep = %#v, %t; want PENDING(1), true", state, ok)
