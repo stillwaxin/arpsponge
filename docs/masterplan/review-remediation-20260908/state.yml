@@ -1,0 +1,24 @@
+---
+schema_version: 9
+slug: review-remediation-20260908
+status: in-progress
+phase: plan
+topic: "full read the recent review and perform remediation, use sub-agents as needed and determine which model to use based on your own judgement"
+complexity: complex
+complexity_source: null
+autonomy: full
+planning_mode: serial
+created_at: 2026-09-08T13:09:00.133Z
+predecessor_transcript: null
+spec_path: /Volumes/CaseSensitive/git/arpsponge/docs/masterplan/review-remediation-20260908/spec.md
+plan_path: /Volumes/CaseSensitive/git/arpsponge/docs/masterplan/review-remediation-20260908/plan.md
+plan_index_path: /Volumes/CaseSensitive/git/arpsponge/docs/masterplan/review-remediation-20260908/plan.index.json
+tasks: []
+active_run: null
+pending_gate: null
+goals_enabled: true
+goals: [{"id":"G1","text":"Resolve all eight findings in REVIEW-2026-09-08.md with source-backed fixes and regression coverage.","signal":"test"},{"id":"G2","text":"Preserve pacing fairness, sparse initial-state behavior, clear-versus-send synchronization, passive/dummy semantics, and safe shutdown.","signal":"test"},{"id":"G3","text":"Validate startup and runtime configuration consistently and atomically; reject invalid CLI input before any request.","signal":"test"},{"id":"G4","text":"Verify portable tests, race tests, vet, lint, build, and formatting; add Linux libpcap CI and explicitly report any unexecuted Linux runtime checks.","signal":"command"},{"id":"G5","text":"Review the integrated fixes, preserve unrelated work and the source review, and record completion evidence and remaining limitations.","signal":"test"}]
+review: {"adversary":true}
+render: {"images":"off"}
+dispatch: {"fabric":true}
+goals_md_hash: sha256:95ed6c262a2324991f276c7be29a30e3c24b649ab1490b32fd14ca1c578650bc
